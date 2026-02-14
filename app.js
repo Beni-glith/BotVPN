@@ -142,17 +142,37 @@ async function saveTrialAccess(userId) {
 const fs = require('fs');
 const vars = JSON.parse(fs.readFileSync('./.vars.json', 'utf8'));
 
-const BOT_TOKEN = vars.BOT_TOKEN;
-const port = vars.PORT || 6969;
+const BOT_TOKEN = String(vars.BOT_TOKEN || '').trim();
+
+function derivePortFromToken(token) {
+  const tokenPart = String(token || '').split(':')[0];
+  let hash = 0;
+  for (const ch of tokenPart) {
+    hash = (hash * 31 + ch.charCodeAt(0)) % 40000;
+  }
+  return 20000 + hash;
+}
+
+const configuredPort = Number(vars.PORT);
+const port = Number.isInteger(configuredPort) && configuredPort > 0
+  ? configuredPort
+  : derivePortFromToken(BOT_TOKEN);
 const ADMIN = vars.USER_ID; 
 const NAMA_STORE = vars.NAMA_STORE || '@ARI_VPN_STORE';
 const STATIC_QRIS = vars.STATIC_QRIS || vars.DATA_QRIS || 'assets/qris.png';
 const MIN_TOPUP_AMOUNT = Number(vars.MIN_TOPUP_AMOUNT || 10000);
 const GROUP_ID = vars.GROUP_ID;
 
+if (!BOT_TOKEN) {
+  throw new Error('BOT_TOKEN kosong. Isi BOT_TOKEN di file .vars.json');
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 let ADMIN_USERNAME = '@ARI_VPN_STORE';
-const adminIds = ADMIN;
+const adminIds = String(ADMIN || '')
+  .split(',')
+  .map((id) => Number(String(id).trim()))
+  .filter((id) => Number.isInteger(id) && id > 0);
 logger.info('Bot initialized');
 
 (async () => {
@@ -321,7 +341,7 @@ db.run(`CREATE TABLE IF NOT EXISTS transactions (
 const userState = {};
 logger.info('User state initialized');
 
-bot.command(['start', 'menu'], async (ctx) => {
+async function handleStartMenu(ctx) {
   logger.info('Start or Menu command received');
   
   const userId = ctx.from.id;
@@ -345,7 +365,10 @@ bot.command(['start', 'menu'], async (ctx) => {
   });
 
   await sendMainMenu(ctx);
-});
+}
+
+bot.command(['start', 'menu'], handleStartMenu);
+bot.hears(/^(menu|start)$/i, handleStartMenu);
 
 bot.command('admin', async (ctx) => {
   logger.info('Admin menu requested');
@@ -4187,11 +4210,51 @@ async function recordAccountTransaction(userId, type) {
   });
 }
 
-app.listen(port, () => {
-  bot.launch().then(() => {
-      logger.info('Bot telah dimulai');
-  }).catch((error) => {
-      logger.error('Error saat memulai bot:', error);
+function startHttpServer(preferredPort) {
+  const maxAttempts = 30;
+
+  return new Promise((resolve, reject) => {
+    const tryListen = (attempt) => {
+      if (attempt >= maxAttempts) {
+        reject(new Error(`Tidak menemukan port kosong setelah ${maxAttempts} percobaan mulai dari ${preferredPort}`));
+        return;
+      }
+
+      const candidatePort = preferredPort + attempt;
+      const server = app.listen(candidatePort, async () => {
+        try {
+          await bot.telegram.deleteWebhook({ drop_pending_updates: false });
+          const me = await bot.telegram.getMe();
+          logger.info(`Bot aktif sebagai @${me.username}`);
+          await bot.launch({ dropPendingUpdates: false });
+          logger.info('Bot telah dimulai (mode long polling)');
+          logger.info(`Server berjalan di port ${candidatePort}`);
+          resolve({ server, port: candidatePort });
+        } catch (error) {
+          logger.error(`Error saat memulai bot: ${error.message}`);
+          server.close(() => reject(error));
+        }
+      });
+
+      server.on('error', (err) => {
+        if (err && err.code === 'EADDRINUSE') {
+          logger.warn(`Port ${candidatePort} sudah dipakai, mencoba port berikutnya...`);
+          tryListen(attempt + 1);
+          return;
+        }
+        reject(err);
+      });
+    };
+
+    tryListen(0);
   });
-  logger.info(`Server berjalan di port ${port}`);
+}
+
+startHttpServer(port).catch((err) => {
+  logger.error(`Gagal menjalankan server: ${err.message}`);
+  process.exit(1);
+});
+
+bot.catch((error, ctx) => {
+  logger.error(`Unhandled bot error on update ${ctx?.update?.update_id || '-'}: ${error.message}`);
 });
